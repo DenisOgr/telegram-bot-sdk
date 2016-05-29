@@ -2,15 +2,14 @@
 
 namespace Telegram\Bot\Commands;
 
-use Telegram\Bot\Answers\AnswerBus;
 use Telegram\Bot\Api;
-use Telegram\Bot\Objects\Update;
 use Telegram\Bot\Exceptions\TelegramSDKException;
+use Telegram\Bot\Objects\Update;
 
 /**
  * Class CommandBus.
  */
-class CommandBus extends AnswerBus
+class CommandBus
 {
     /**
      * @var Command[] Holds all commands.
@@ -18,9 +17,15 @@ class CommandBus extends AnswerBus
     protected $commands = [];
 
     /**
-     * @var Command[] Holds all commands' aliases.
+     * Default command (handles messages without command)
+     * @var string
      */
-    protected $commandAliases = [];
+    protected $defaultCommand = null;
+
+    /**
+     * @var Api
+     */
+    private $telegram;
 
     /**
      * Instantiate Command Bus.
@@ -42,6 +47,12 @@ class CommandBus extends AnswerBus
     public function getCommands()
     {
         return $this->commands;
+    }
+
+    public function setDefaultCommand($command)
+    {
+        $this->defaultCommand = (string)$command;
+        return true;
     }
 
     /**
@@ -82,7 +93,7 @@ class CommandBus extends AnswerBus
             }
 
             if ($this->telegram->hasContainer()) {
-                $command = $this->buildDependencyInjectedAnswer($command);
+                $command = $this->buildDependencyInjectedCommand($command);
             } else {
                 $command = new $command();
             }
@@ -96,32 +107,6 @@ class CommandBus extends AnswerBus
              * @var Command $command
              */
             $this->commands[$command->getName()] = $command;
-
-            $aliases = $command->getAliases();
-
-            if (empty($aliases)) {
-                return $this;
-            }
-
-            foreach ($command->getAliases() as $alias) {
-                if (isset($this->commands[$alias])) {
-                    throw new TelegramSDKException(sprintf(
-                        '[Error] Alias [%s] conflicts with command name of "%s" try with another name or remove this alias from the list.',
-                        $alias,
-                        get_class($command)
-                    ));
-                }
-
-                if (isset($this->commandAliases[$alias])) {
-                    throw new TelegramSDKException(sprintf(
-                        '[Error] Alias [%s] conflicts with another command\'s alias list: "%s", try with another name or remove this alias from the list.',
-                        $alias,
-                        get_class($command)
-                    ));
-                }
-
-                $this->commandAliases[$alias] = $command;
-            }
 
             return $this;
         }
@@ -165,6 +150,33 @@ class CommandBus extends AnswerBus
     }
 
     /**
+     * Handles Inbound Messages and Executes Appropriate Command.
+     *
+     * @param $message
+     * @param $update
+     *
+     * @throws TelegramSDKException
+     *
+     * @return Update
+     */
+    public function handler($message, Update $update)
+    {
+        $match = $this->parseCommand($message);
+        if (!empty($match)) {
+            $command = $match[1];
+//            $bot = (!empty($match[2])) ? $match[2] : '';
+            $arguments = $match[3];
+            $this->execute($command, $arguments, $update);
+        } else {
+            if ($this->defaultCommand) {
+                $this->execute($this->defaultCommand, $message, $update);
+            }
+        }
+
+        return $update;
+    }
+
+    /**
      * Parse a Command for a Match.
      *
      * @param $text
@@ -185,30 +197,6 @@ class CommandBus extends AnswerBus
     }
 
     /**
-     * Handles Inbound Messages and Executes Appropriate Command.
-     *
-     * @param $message
-     * @param $update
-     *
-     * @throws TelegramSDKException
-     *
-     * @return Update
-     */
-    protected function handler($message, Update $update)
-    {
-        $match = $this->parseCommand($message);
-        if (!empty($match)) {
-            $command = strtolower($match[1]); //All commands must be lowercase.
-//            $bot = (!empty($match[2])) ? $match[2] : '';
-            $arguments = $match[3];
-
-            $this->execute($command, $arguments, $update);
-        }
-
-        return $update;
-    }
-
-    /**
      * Execute the command.
      *
      * @param $name
@@ -217,16 +205,51 @@ class CommandBus extends AnswerBus
      *
      * @return mixed
      */
-    protected function execute($name, $arguments, $message)
+    public function execute($name, $arguments, $message)
     {
         if (array_key_exists($name, $this->commands)) {
             return $this->commands[$name]->make($this->telegram, $arguments, $message);
-        } elseif (array_key_exists($name, $this->commandAliases)) {
-            return $this->commandAliases[$name]->make($this->telegram, $arguments, $message);
         } elseif (array_key_exists('help', $this->commands)) {
             return $this->commands['help']->make($this->telegram, $arguments, $message);
         }
 
         return 'Ok';
+    }
+
+    /**
+     * Use PHP Reflection and Laravel Container to instantiate the command with type hinted dependencies.
+     *
+     * @param $commandClass
+     *
+     * @return object
+     */
+    private function buildDependencyInjectedCommand($commandClass)
+    {
+
+        // check if the command has a constructor
+        if (!method_exists($commandClass, '__construct')) {
+            return new $commandClass();
+        }
+
+        // get constructor params
+        $constructorReflector = new \ReflectionMethod($commandClass, '__construct');
+        $params = $constructorReflector->getParameters();
+
+        // if no params are needed proceed with normal instantiation
+        if (empty($params)) {
+            return new $commandClass();
+        }
+
+        // otherwise fetch each dependency out of the container
+        $container = $this->telegram->getContainer();
+        $dependencies = [];
+        foreach ($params as $param) {
+            $dependencies[] = $container->make($param->getClass()->name);
+        }
+
+        // and instantiate the object with dependencies through ReflectionClass
+        $classReflector = new \ReflectionClass($commandClass);
+
+        return $classReflector->newInstanceArgs($dependencies);
     }
 }
